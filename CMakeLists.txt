@@ -1,6 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
 
-# Use embedded debug information with the MSVC compiler.
 set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT Embedded)
 
 project(PlatformAdventure LANGUAGES CXX)
@@ -9,7 +8,7 @@ include(FetchContent)
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
-set(SFML_BUILD_AUDIO OFF CACHE BOOL "" FORCE)
+set(SFML_BUILD_AUDIO ON CACHE BOOL "" FORCE)
 set(SFML_BUILD_NETWORK OFF CACHE BOOL "" FORCE)
 set(SFML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(SFML_BUILD_TEST_SUITE OFF CACHE BOOL "" FORCE)
@@ -44,4 +43,11 @@ target_link_libraries(
     PlatformAdventure
     PRIVATE
     SFML::Graphics
+    SFML::Audio
+)
+
+target_compile_definitions(
+    PlatformAdventure
+    PRIVATE
+    GAME_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets"
 )

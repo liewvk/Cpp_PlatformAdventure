@@ -1,9 +1,16 @@
+#include <SFML/Audio.hpp>
 #include <SFML/Graphics.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -24,13 +31,252 @@ namespace
     constexpr float MaximumFallSpeed = 900.f;
     constexpr float FixedStep = 1.f / 120.f;
 
+    constexpr int MaximumScore = 800;
+
     enum class State
     {
+        Menu,
         Playing,
         Paused,
         Won,
         GameOver
     };
+
+    enum class Cue
+    {
+        Jump,
+        Coin,
+        Stomp,
+        Damage,
+        Checkpoint,
+        Win
+    };
+
+    class Audio
+    {
+    public:
+        Audio()
+        {
+            const std::array<float, 6> start{
+                250.f, 900.f, 180.f, 220.f, 500.f, 600.f
+            };
+
+            const std::array<float, 6> finish{
+                650.f, 1400.f, 70.f, 50.f, 1100.f, 1500.f
+            };
+
+            const std::array<float, 6> duration{
+                0.12f, 0.12f, 0.15f, 0.25f, 0.30f, 0.55f
+            };
+
+            constexpr unsigned int SampleRate = 44100;
+            constexpr float Pi = 3.14159265359f;
+
+            for (std::size_t sound = 0; sound < buffers.size(); ++sound)
+            {
+                const auto count = static_cast<std::size_t>(
+                    duration[sound] * SampleRate);
+
+                std::vector<std::int16_t> samples(count);
+                float phase = 0.f;
+
+                for (std::size_t i = 0; i < count; ++i)
+                {
+                    const float progress =
+                        static_cast<float>(i)
+                        / static_cast<float>(count);
+
+                    const float frequency =
+                        start[sound]
+                        + (finish[sound] - start[sound]) * progress;
+
+                    phase += 2.f * Pi * frequency / SampleRate;
+
+                    const float attack =
+                        std::min(1.f, progress / 0.03f);
+
+                    const float decay =
+                        (1.f - progress) * (1.f - progress);
+
+                    const float sample =
+                        std::sin(phase) * attack * decay * 0.4f;
+
+                    samples[i] = static_cast<std::int16_t>(
+                        sample * 32767.f);
+                }
+
+                ready[sound] = buffers[sound].loadFromSamples(
+                    samples.data(),
+                    samples.size(),
+                    1,
+                    SampleRate,
+                    { sf::SoundChannel::Mono });
+            }
+        }
+
+        Audio(const Audio&) = delete;
+        Audio& operator=(const Audio&) = delete;
+
+        void play(Cue cue)
+        {
+            const auto index = static_cast<std::size_t>(cue);
+
+            if (muted || paused || !ready[index])
+                return;
+
+            cleanup();
+
+            if (voices.size() >= 16)
+            {
+                voices.front()->stop();
+                voices.erase(voices.begin());
+            }
+
+            auto voice =
+                std::make_unique<sf::Sound>(buffers[index]);
+
+            voice->setVolume(40.f);
+            voice->play();
+
+            voices.push_back(std::move(voice));
+        }
+
+        void cleanup()
+        {
+            voices.erase(
+                std::remove_if(
+                    voices.begin(),
+                    voices.end(),
+                    [](const std::unique_ptr<sf::Sound>& voice)
+                    {
+                        return voice->getStatus()
+                            == sf::SoundSource::Status::Stopped;
+                    }),
+                voices.end());
+        }
+
+        void setPaused(bool value)
+        {
+            if (paused == value)
+                return;
+
+            paused = value;
+
+            for (auto& voice : voices)
+            {
+                if (paused
+                    && voice->getStatus()
+                    == sf::SoundSource::Status::Playing)
+                {
+                    voice->pause();
+                }
+                else if (!paused
+                    && voice->getStatus()
+                    == sf::SoundSource::Status::Paused)
+                {
+                    voice->play();
+                }
+            }
+        }
+
+        void toggleMute()
+        {
+            muted = !muted;
+
+            if (muted)
+                clear();
+        }
+
+        bool isMuted() const
+        {
+            return muted;
+        }
+
+        void clear()
+        {
+            for (auto& voice : voices)
+                voice->stop();
+
+            voices.clear();
+        }
+
+    private:
+        // Voices are destroyed before the buffers they use.
+        std::array<sf::SoundBuffer, 6> buffers;
+        std::array<bool, 6> ready{};
+
+        std::vector<std::unique_ptr<sf::Sound>> voices;
+
+        bool muted = false;
+        bool paused = false;
+    };
+
+    std::filesystem::path highScorePath()
+    {
+        std::filesystem::path base;
+
+#ifdef _WIN32
+        char* folder = nullptr;
+        std::size_t length = 0;
+
+        if (_dupenv_s(&folder, &length, "LOCALAPPDATA") == 0
+            && folder != nullptr)
+        {
+            base = folder;
+        }
+
+        std::free(folder);
+#endif
+
+        if (base.empty())
+        {
+            std::error_code error;
+            base = std::filesystem::current_path(error);
+
+            if (error)
+                base = ".";
+        }
+
+        return base / "VBTutor" / "PlatformAdventure"
+            / "highscore.txt";
+    }
+
+    int loadHighScore(const std::filesystem::path& path)
+    {
+        std::ifstream input(path);
+        int score = 0;
+
+        if (input >> score)
+        {
+            if (score >= 0 && score <= MaximumScore)
+                return score;
+        }
+
+        return 0;
+    }
+
+    bool saveHighScore(
+        const std::filesystem::path& path,
+        int score)
+    {
+        std::error_code error;
+
+        std::filesystem::create_directories(
+            path.parent_path(), error);
+
+        if (error)
+            return false;
+
+        std::ofstream output(path, std::ios::trunc);
+
+        if (!output)
+            return false;
+
+        output << score << '\n';
+        output.flush();
+
+        return static_cast<bool>(output);
+    }
 
     struct Player
     {
@@ -57,15 +303,27 @@ namespace
             shape.setPosition(centre);
             shape.setFillColor(sf::Color(255, 210, 60));
         }
+
+        sf::FloatRect collisionBounds() const
+        {
+            // Keep collision bounds constant while animating.
+            const auto position = shape.getPosition();
+
+            return sf::FloatRect(
+                position - sf::Vector2f{ 10.f, 10.f },
+                { 20.f, 20.f });
+        }
     };
 
     struct Enemy
     {
         sf::RectangleShape shape;
+
         float leftLimit = 0.f;
         float rightLimit = 0.f;
         float direction = 1.f;
         float speed = 80.f;
+
         bool active = true;
 
         explicit Enemy(sf::Vector2f position)
@@ -127,7 +385,6 @@ namespace
         grid[13][1] = 'S';
         grid[13][76] = 'G';
 
-        // Ten coins on the floor and elevated routes.
         grid[10][7] = 'O';
         grid[7][13] = 'O';
         grid[13][22] = 'O';
@@ -139,12 +396,10 @@ namespace
         grid[7][56] = 'O';
         grid[13][72] = 'O';
 
-        // Three enemies on solid sections of floor.
         grid[13][12] = 'E';
         grid[13][32] = 'E';
         grid[13][60] = 'E';
 
-        // Checkpoint before the second gap.
         grid[13][37] = 'K';
 
         return grid;
@@ -156,17 +411,13 @@ namespace
             throw std::runtime_error("The level is empty.");
 
         Level level;
-
         const std::size_t columns = grid.front().size();
 
-        level.width =
-            static_cast<float>(columns) * TileSize;
+        level.width = static_cast<float>(columns) * TileSize;
+        level.height = static_cast<float>(grid.size()) * TileSize;
 
-        level.height =
-            static_cast<float>(grid.size()) * TileSize;
-
-        if (level.width < WindowWidth ||
-            level.height != WindowHeight)
+        if (level.width < WindowWidth
+            || level.height != WindowHeight)
         {
             throw std::runtime_error(
                 "The level must be at least 800 pixels wide "
@@ -179,73 +430,63 @@ namespace
         for (std::size_t row = 0; row < grid.size(); ++row)
         {
             if (grid[row].size() != columns)
-            {
-                throw std::runtime_error(
-                    "All level rows must have the same width.");
-            }
+                throw std::runtime_error("Unequal level row widths.");
 
-            for (std::size_t column = 0;
-                column < columns;
-                ++column)
+            for (std::size_t column = 0; column < columns; ++column)
             {
                 const char tile = grid[row][column];
-
-                const float x =
-                    static_cast<float>(column) * TileSize;
-
-                const float y =
-                    static_cast<float>(row) * TileSize;
+                const float x = static_cast<float>(column) * TileSize;
+                const float y = static_cast<float>(row) * TileSize;
 
                 const sf::Vector2f playerPosition{
                     x + (TileSize - PlayerWidth) / 2.f,
                     y + TileSize - PlayerHeight
                 };
 
-                if (tile == 'S')
+                switch (tile)
                 {
+                case 'S':
                     ++spawnCount;
                     level.spawn = playerPosition;
-                }
-                else if (tile == 'G')
-                {
-                    ++goalCount;
+                    break;
 
+                case 'G':
+                    ++goalCount;
                     level.goalBounds = sf::FloatRect(
                         { x, y - TileSize },
                         { TileSize, TileSize * 2.f });
-                }
-                else if (tile == 'O')
-                {
+                    break;
+
+                case 'O':
                     level.coins.emplace_back(
-                        sf::Vector2f{
-                            x + TileSize / 2.f,
-                            y + TileSize / 2.f });
-                }
-                else if (tile == 'E')
-                {
+                        sf::Vector2f{ x + 20.f, y + 20.f });
+                    break;
+
+                case 'E':
                     level.enemies.emplace_back(
                         sf::Vector2f{ x + 4.f, y + 8.f });
-                }
-                else if (tile == 'K')
+                    break;
+
+                case 'K':
                 {
                     Checkpoint checkpoint;
-
                     checkpoint.bounds = sf::FloatRect(
                         { x, y - TileSize },
                         { TileSize, TileSize * 2.f });
-
                     checkpoint.respawn = playerPosition;
-
                     level.checkpoints.push_back(checkpoint);
+                    break;
                 }
-                else if (tile != '.' && tile != '#')
-                {
-                    throw std::runtime_error(
-                        "Unknown character in level data.");
+
+                case '.':
+                case '#':
+                    break;
+
+                default:
+                    throw std::runtime_error("Unknown level symbol.");
                 }
             }
 
-            // Combine each horizontal run of solid tiles.
             std::size_t column = 0;
 
             while (column < columns)
@@ -258,11 +499,8 @@ namespace
 
                 const std::size_t first = column;
 
-                while (column < columns &&
-                    grid[row][column] == '#')
-                {
+                while (column < columns && grid[row][column] == '#')
                     ++column;
-                }
 
                 sf::RectangleShape platform({
                     static_cast<float>(column - first) * TileSize,
@@ -284,12 +522,9 @@ namespace
         }
 
         if (spawnCount != 1 || goalCount != 1)
-        {
-            throw std::runtime_error(
-                "The level needs exactly one S and one G.");
-        }
+            throw std::runtime_error("Exactly one S and G are required.");
 
-        auto safeRespawn = [&](sf::Vector2f position)
+        auto safePosition = [&](sf::Vector2f position)
             {
                 const sf::FloatRect body(
                     position, { PlayerWidth, PlayerHeight });
@@ -303,9 +538,9 @@ namespace
                     if (body.findIntersection(bounds))
                         return false;
 
-                    const float feet = position.y + PlayerHeight;
-
-                    if (std::abs(feet - bounds.position.y) < 0.1f
+                    if (std::abs(
+                        position.y + PlayerHeight
+                        - bounds.position.y) < 0.1f
                         && position.x >= bounds.position.x
                         && position.x + PlayerWidth
                         <= bounds.position.x + bounds.size.x)
@@ -317,20 +552,15 @@ namespace
                 return supported;
             };
 
-        if (!safeRespawn(level.spawn))
-            throw std::runtime_error("The start is not safe.");
+        if (!safePosition(level.spawn))
+            throw std::runtime_error("Unsafe starting position.");
 
         for (const auto& checkpoint : level.checkpoints)
         {
-            if (!safeRespawn(checkpoint.respawn))
-            {
-                throw std::runtime_error(
-                    "A checkpoint respawn position is not safe.");
-            }
+            if (!safePosition(checkpoint.respawn))
+                throw std::runtime_error("Unsafe checkpoint position.");
         }
 
-        // Set patrol limits within each enemy's supporting
-        // platform, so enemies do not walk into floor gaps.
         for (auto& enemy : level.enemies)
         {
             const auto position = enemy.shape.getPosition();
@@ -359,10 +589,7 @@ namespace
             }
 
             if (!supported)
-            {
-                throw std::runtime_error(
-                    "An enemy needs a supporting platform.");
-            }
+                throw std::runtime_error("Enemy has no supporting platform.");
         }
 
         return level;
@@ -370,23 +597,28 @@ namespace
 
     struct Game
     {
+        Audio audio;
         Player player;
         Level level;
         sf::View camera;
 
-        State state = State::Playing;
-
+        State state = State::Menu;
         sf::Vector2f respawnPosition{ 0.f, 0.f };
+
+        std::filesystem::path scorePath = highScorePath();
 
         int lives = 3;
         int score = 0;
+        int bestScore = 0;
         int collectedCoins = 0;
 
         float elapsedTime = 0.f;
         float protection = 0.f;
+        float jumpBuffer = 0.f;
+        float coyoteTime = 0.f;
 
-        bool jumpRequested = false;
         bool checkpointReached = false;
+        bool saveFailed = false;
 
         Game()
             : level(loadLevel(makeLevelData())),
@@ -396,6 +628,7 @@ namespace
         {
             respawnPosition = level.spawn;
             player.shape.setPosition(respawnPosition);
+            bestScore = loadHighScore(scorePath);
         }
     };
 
@@ -406,9 +639,7 @@ namespace
             WindowWidth / 2.f,
             game.level.width - WindowWidth / 2.f);
 
-        game.camera.setCenter({
-            centreX, WindowHeight / 2.f
-            });
+        game.camera.setCenter({ centreX, WindowHeight / 2.f });
     }
 
     void respawnPlayer(Game& game)
@@ -417,17 +648,19 @@ namespace
         game.player.velocity = { 0.f, 0.f };
         game.player.grounded = false;
 
-        game.jumpRequested = false;
+        game.jumpBuffer = 0.f;
+        game.coyoteTime = 0.f;
         game.protection = 1.2f;
 
         updateCamera(game);
     }
 
-    void restartGame(Game& game)
+    void resetRun(Game& game)
     {
-        game.level = loadLevel(makeLevelData());
+        game.audio.clear();
+        game.audio.setPaused(false);
 
-        game.state = State::Playing;
+        game.level = loadLevel(makeLevelData());
         game.respawnPosition = game.level.spawn;
 
         game.lives = 3;
@@ -440,18 +673,49 @@ namespace
         game.protection = 0.f;
     }
 
+    void startGame(Game& game)
+    {
+        resetRun(game);
+        game.state = State::Playing;
+    }
+
+    void returnToMenu(Game& game)
+    {
+        resetRun(game);
+        game.state = State::Menu;
+    }
+
+    void finishGame(Game& game, State result)
+    {
+        if (game.state != State::Playing)
+            return;
+
+        game.state = result;
+        game.jumpBuffer = 0.f;
+
+        if (result == State::Won)
+            game.audio.play(Cue::Win);
+
+        if (game.score > game.bestScore)
+        {
+            game.bestScore = game.score;
+            game.saveFailed =
+                !saveHighScore(game.scorePath, game.bestScore);
+        }
+    }
+
     void loseLife(Game& game)
     {
         if (game.state != State::Playing)
             return;
 
+        game.audio.play(Cue::Damage);
         --game.lives;
-        game.jumpRequested = false;
 
         if (game.lives <= 0)
         {
-            game.state = State::GameOver;
             game.player.velocity = { 0.f, 0.f };
+            finishGame(game, State::GameOver);
         }
         else
         {
@@ -461,7 +725,7 @@ namespace
 
     void moveHorizontally(Game& game, float dt)
     {
-        Player& player = game.player;
+        auto& player = game.player;
         const float movement = player.velocity.x * dt;
 
         if (movement == 0.f)
@@ -473,11 +737,8 @@ namespace
         {
             const auto bounds = platform.getGlobalBounds();
 
-            if (!player.shape.getGlobalBounds()
-                .findIntersection(bounds))
-            {
+            if (!player.shape.getGlobalBounds().findIntersection(bounds))
                 continue;
-            }
 
             auto position = player.shape.getPosition();
 
@@ -499,7 +760,7 @@ namespace
 
     void moveVertically(Game& game, float dt)
     {
-        Player& player = game.player;
+        auto& player = game.player;
 
         player.velocity.y = std::min(
             player.velocity.y + Gravity * dt,
@@ -514,11 +775,8 @@ namespace
         {
             const auto bounds = platform.getGlobalBounds();
 
-            if (!player.shape.getGlobalBounds()
-                .findIntersection(bounds))
-            {
+            if (!player.shape.getGlobalBounds().findIntersection(bounds))
                 continue;
-            }
 
             auto position = player.shape.getPosition();
 
@@ -563,44 +821,35 @@ namespace
         }
     }
 
-    // Returns true if a harmful collision ended this update.
-    bool checkEnemyCollisions(
-        Game& game,
-        const sf::FloatRect& previousPlayerBounds)
+    bool checkEnemies(Game& game, const sf::FloatRect& previousBounds)
     {
         for (auto& enemy : game.level.enemies)
         {
             if (!enemy.active)
                 continue;
 
-            const auto enemyBounds =
-                enemy.shape.getGlobalBounds();
+            const auto bounds = enemy.shape.getGlobalBounds();
 
-            if (!game.player.shape.getGlobalBounds()
-                .findIntersection(enemyBounds))
-            {
+            if (!game.player.shape.getGlobalBounds().findIntersection(bounds))
                 continue;
-            }
 
             const float previousFeet =
-                previousPlayerBounds.position.y
-                + previousPlayerBounds.size.y;
+                previousBounds.position.y + previousBounds.size.y;
 
-            const bool stomp =
-                game.player.velocity.y > 0.f
-                && previousFeet <= enemyBounds.position.y + 0.1f;
-
-            if (stomp)
+            if (game.player.velocity.y > 0.f
+                && previousFeet <= bounds.position.y + 0.1f)
             {
                 enemy.active = false;
                 game.score += 100;
+                game.audio.play(Cue::Stomp);
 
                 auto position = game.player.shape.getPosition();
-                position.y = enemyBounds.position.y - PlayerHeight;
+                position.y = bounds.position.y - PlayerHeight;
 
                 game.player.shape.setPosition(position);
                 game.player.velocity.y = -360.f;
                 game.player.grounded = false;
+                game.coyoteTime = 0.f;
 
                 break;
             }
@@ -617,35 +866,32 @@ namespace
 
     void collectCoins(Game& game)
     {
-        const auto playerBounds =
-            game.player.shape.getGlobalBounds();
+        const auto bounds = game.player.shape.getGlobalBounds();
 
         for (auto& coin : game.level.coins)
         {
-            if (coin.active
-                && playerBounds.findIntersection(
-                    coin.shape.getGlobalBounds()))
+            if (coin.active && bounds.findIntersection(coin.collisionBounds()))
             {
                 coin.active = false;
                 ++game.collectedCoins;
                 game.score += 50;
+                game.audio.play(Cue::Coin);
             }
         }
     }
 
     void activateCheckpoints(Game& game)
     {
-        const auto playerBounds =
-            game.player.shape.getGlobalBounds();
+        const auto bounds = game.player.shape.getGlobalBounds();
 
         for (auto& checkpoint : game.level.checkpoints)
         {
-            if (!checkpoint.active
-                && playerBounds.findIntersection(checkpoint.bounds))
+            if (!checkpoint.active && bounds.findIntersection(checkpoint.bounds))
             {
                 checkpoint.active = true;
                 game.respawnPosition = checkpoint.respawn;
                 game.checkpointReached = true;
+                game.audio.play(Cue::Checkpoint);
             }
         }
     }
@@ -653,11 +899,14 @@ namespace
     void updateGame(Game& game, float dt)
     {
         game.elapsedTime += dt;
+        game.protection = std::max(0.f, game.protection - dt);
 
-        game.protection =
-            std::max(0.f, game.protection - dt);
+        if (game.player.grounded)
+            game.coyoteTime = 0.08f;
+        else
+            game.coyoteTime = std::max(0.f, game.coyoteTime - dt);
 
-        const auto previousPlayerBounds =
+        const auto previousBounds =
             game.player.shape.getGlobalBounds();
 
         float input = 0.f;
@@ -670,27 +919,42 @@ namespace
 
         game.player.velocity.x = input * MoveSpeed;
 
-        if (game.jumpRequested && game.player.grounded)
+        if (game.jumpBuffer > 0.f && game.coyoteTime > 0.f)
         {
             game.player.velocity.y = -JumpSpeed;
             game.player.grounded = false;
+
+            game.jumpBuffer = 0.f;
+            game.coyoteTime = 0.f;
+
+            game.audio.play(Cue::Jump);
         }
 
-        game.jumpRequested = false;
+        game.jumpBuffer = std::max(0.f, game.jumpBuffer - dt);
 
         moveHorizontally(game, dt);
         moveVertically(game, dt);
         updateEnemies(game, dt);
 
-        if (game.player.shape.getPosition().y
-                > game.level.height + 100.f)
+        for (auto& coin : game.level.coins)
+        {
+            const float phase =
+                game.elapsedTime * 4.f + coin.shape.getPosition().x * 0.01f;
+
+            coin.shape.setScale({
+                0.35f + 0.65f * std::abs(std::cos(phase)),
+                1.f
+                });
+        }
+
+        if (game.player.shape.getPosition().y > game.level.height + 100.f)
         {
             loseLife(game);
             updateCamera(game);
             return;
         }
 
-        if (checkEnemyCollisions(game, previousPlayerBounds))
+        if (checkEnemies(game, previousBounds))
         {
             updateCamera(game);
             return;
@@ -702,40 +966,46 @@ namespace
         if (game.player.shape.getGlobalBounds()
             .findIntersection(game.level.goalBounds))
         {
-            game.state = State::Won;
-            game.jumpRequested = false;
+            finishGame(game, State::Won);
         }
 
         updateCamera(game);
     }
 
-    void updateTitle(
-        sf::RenderWindow& window,
-        const Game& game)
+    std::string timeString(float seconds)
     {
-        std::ostringstream title;
+        std::ostringstream text;
+        text << std::fixed << std::setprecision(1) << seconds << "s";
+        return text.str();
+    }
 
-        title << "PlatformAdventure | ";
+    void drawText(
+        sf::RenderTarget& target,
+        const sf::Font& font,
+        const std::string& message,
+        unsigned int size,
+        float x,
+        float y,
+        sf::Color colour = sf::Color::White,
+        bool centred = false)
+    {
+        sf::Text text(font);
+        text.setString(message);
+        text.setCharacterSize(size);
+        text.setFillColor(colour);
 
-        if (game.state == State::Won)
-            title << "LEVEL COMPLETE! R: Restart";
-        else if (game.state == State::GameOver)
-            title << "GAME OVER - R: Restart";
-        else if (game.state == State::Paused)
-            title << "PAUSED - P: Resume";
-        else
-            title << "Arrows: Move | Space: Jump | P: Pause | R: Restart";
+        if (centred)
+        {
+            const auto bounds = text.getLocalBounds();
 
-        title << " | Lives: " << game.lives
-            << " | Score: " << game.score
-            << " | Coins: " << game.collectedCoins
-            << "/" << game.level.coins.size()
-            << " | Checkpoint: "
-            << (game.checkpointReached ? "Active" : "Start")
-            << " | Time: " << std::fixed << std::setprecision(1)
-            << game.elapsedTime << "s";
+            text.setOrigin({
+                bounds.position.x + bounds.size.x / 2.f,
+                bounds.position.y + bounds.size.y / 2.f
+                });
+        }
 
-        window.setTitle(title.str());
+        text.setPosition({ x, y });
+        target.draw(text);
     }
 
     void drawFlag(
@@ -744,24 +1014,150 @@ namespace
         sf::Color colour)
     {
         sf::RectangleShape pole({ 5.f, bounds.size.y });
-        pole.setPosition({
-            bounds.position.x + 5.f,
-            bounds.position.y
-            });
+        pole.setPosition({ bounds.position.x + 5.f, bounds.position.y });
         pole.setFillColor(sf::Color::White);
 
         sf::RectangleShape flag({ 30.f, 22.f });
-        flag.setPosition({
-            bounds.position.x + 10.f,
-            bounds.position.y
-            });
+        flag.setPosition({ bounds.position.x + 10.f, bounds.position.y });
         flag.setFillColor(colour);
 
         window.draw(pole);
         window.draw(flag);
     }
 
-    void drawGame(sf::RenderWindow& window, Game& game)
+    void drawPanel(sf::RenderWindow& window)
+    {
+        sf::RectangleShape panel({ WindowWidth, WindowHeight });
+        panel.setFillColor(sf::Color(0, 0, 0, 190));
+        window.draw(panel);
+    }
+
+    void drawInterface(
+        sf::RenderWindow& window,
+        const sf::Font& font,
+        const Game& game)
+    {
+        const auto cyan = sf::Color(100, 230, 255);
+
+        if (game.state == State::Menu)
+        {
+            drawPanel(window);
+
+            drawText(window, font, "PLATFORM ADVENTURE",
+                40, 400.f, 110.f, cyan, true);
+
+            drawText(window, font, "Reach the yellow finish flag",
+                24, 400.f, 190.f, sf::Color::White, true);
+
+            drawText(window, font, "Collect coins and stomp enemies",
+                22, 400.f, 235.f, sf::Color::White, true);
+
+            drawText(window, font,
+                "Best score: " + std::to_string(game.bestScore),
+                26, 400.f, 300.f, sf::Color(255, 210, 60), true);
+
+            drawText(window, font, "Enter: Start",
+                28, 400.f, 365.f, sf::Color::White, true);
+
+            drawText(window, font, "Arrows: Move    Space: Jump",
+                20, 400.f, 430.f, sf::Color::White, true);
+
+            drawText(window, font, "P: Pause    R: Restart    M: Menu",
+                20, 400.f, 470.f, sf::Color::White, true);
+        }
+        else
+        {
+            sf::RectangleShape hud({ WindowWidth, 66.f });
+            hud.setFillColor(sf::Color(0, 0, 0, 190));
+            window.draw(hud);
+
+            drawText(window, font,
+                "Lives: " + std::to_string(game.lives),
+                19, 12.f, 6.f);
+
+            drawText(window, font,
+                "Score: " + std::to_string(game.score),
+                19, 125.f, 6.f);
+
+            drawText(window, font,
+                "Coins: " + std::to_string(game.collectedCoins)
+                + "/" + std::to_string(game.level.coins.size()),
+                19, 285.f, 6.f);
+
+            drawText(window, font,
+                "Best: " + std::to_string(game.bestScore),
+                19, 445.f, 6.f);
+
+            drawText(window, font,
+                "Time: " + timeString(game.elapsedTime),
+                19, 610.f, 6.f);
+
+            drawText(window, font,
+                game.checkpointReached
+                ? "Checkpoint: Active"
+                : "Checkpoint: Start",
+                17, 12.f, 36.f, cyan);
+
+            if (game.state == State::Paused)
+            {
+                drawPanel(window);
+
+                drawText(window, font, "PAUSED",
+                    44, 400.f, 245.f, cyan, true);
+
+                drawText(window, font, "P: Resume    M: Menu",
+                    24, 400.f, 315.f, sf::Color::White, true);
+            }
+
+            if (game.state == State::Won || game.state == State::GameOver)
+            {
+                drawPanel(window);
+
+                drawText(window, font,
+                    game.state == State::Won
+                    ? "ADVENTURE COMPLETE"
+                    : "GAME OVER",
+                    38, 400.f, 180.f, cyan, true);
+
+                drawText(window, font,
+                    "Score: " + std::to_string(game.score),
+                    28, 400.f, 250.f, sf::Color::White, true);
+
+                drawText(window, font,
+                    "Coins: " + std::to_string(game.collectedCoins)
+                    + "/" + std::to_string(game.level.coins.size()),
+                    24, 400.f, 295.f, sf::Color::White, true);
+
+                drawText(window, font,
+                    "Time: " + timeString(game.elapsedTime),
+                    24, 400.f, 335.f, sf::Color::White, true);
+
+                drawText(window, font,
+                    "Best: " + std::to_string(game.bestScore),
+                    24, 400.f, 375.f,
+                    sf::Color(255, 210, 60), true);
+
+                drawText(window, font, "Enter: Play again    M: Menu",
+                    22, 400.f, 445.f, sf::Color::White, true);
+            }
+        }
+
+        drawText(
+            window, font,
+            game.audio.isMuted() ? "V: Sound off" : "V: Sound on",
+            17, 630.f, 565.f);
+
+        if (game.saveFailed)
+        {
+            drawText(window, font, "High score could not be saved.",
+                17, 15.f, 565.f, sf::Color(255, 150, 100));
+        }
+    }
+
+    void drawGame(
+        sf::RenderWindow& window,
+        const sf::Font& font,
+        Game& game)
     {
         window.clear(sf::Color(25, 35, 60));
         window.setView(game.camera);
@@ -778,17 +1174,13 @@ namespace
         for (const auto& checkpoint : game.level.checkpoints)
         {
             drawFlag(
-                window,
-                checkpoint.bounds,
+                window, checkpoint.bounds,
                 checkpoint.active
                 ? sf::Color(70, 255, 140)
                 : sf::Color(150, 150, 160));
         }
 
-        drawFlag(
-            window,
-            game.level.goalBounds,
-            sf::Color(255, 210, 70));
+        drawFlag(window, game.level.goalBounds, sf::Color(255, 210, 70));
 
         for (const auto& enemy : game.level.enemies)
         {
@@ -796,34 +1188,22 @@ namespace
                 window.draw(enemy.shape);
         }
 
-        sf::Color playerColour = sf::Color(80, 210, 255);
-
-        if (game.protection > 0.f
-            && static_cast<int>(game.protection * 12.f) % 2 == 0)
+        if (game.state != State::Menu)
         {
-            playerColour.a = 90;
-        }
+            sf::Color colour(80, 210, 255);
 
-        game.player.shape.setFillColor(playerColour);
-        window.draw(game.player.shape);
+            if (game.protection > 0.f
+                && static_cast<int>(game.protection * 12.f) % 2 == 0)
+            {
+                colour.a = 90;
+            }
+
+            game.player.shape.setFillColor(colour);
+            window.draw(game.player.shape);
+        }
 
         window.setView(window.getDefaultView());
-
-        if (game.state != State::Playing)
-        {
-            sf::RectangleShape overlay(
-                { WindowWidth, WindowHeight });
-
-            if (game.state == State::Won)
-                overlay.setFillColor(sf::Color(20, 100, 50, 80));
-            else if (game.state == State::GameOver)
-                overlay.setFillColor(sf::Color(130, 20, 20, 100));
-            else
-                overlay.setFillColor(sf::Color(0, 0, 0, 130));
-
-            window.draw(overlay);
-        }
-
+        drawInterface(window, font, game);
         window.display();
     }
 } // namespace
@@ -839,6 +1219,19 @@ int main()
 
         window.setVerticalSyncEnabled(true);
         window.setKeyRepeatEnabled(false);
+
+        const auto fontPath =
+            std::filesystem::path(GAME_ASSET_DIR)
+            / "fonts" / "welcome.ttf";
+
+        sf::Font font;
+
+        if (!font.openFromFile(fontPath))
+        {
+            std::cerr << "Unable to load the font.\n"
+                << "Expected location: " << fontPath << '\n';
+            return 1;
+        }
 
         Game game;
         updateCamera(game);
@@ -862,12 +1255,11 @@ int main()
                     && game.state == State::Playing)
                 {
                     game.state = State::Paused;
-                    game.jumpRequested = false;
+                    game.jumpBuffer = 0.f;
                     resetTiming = true;
                 }
 
-                const auto* key =
-                    event->getIf<sf::Event::KeyPressed>();
+                const auto* key = event->getIf<sf::Event::KeyPressed>();
 
                 if (!key)
                     continue;
@@ -876,9 +1268,27 @@ int main()
                 {
                     window.close();
                 }
-                else if (key->code == sf::Keyboard::Key::R)
+                else if (key->code == sf::Keyboard::Key::V)
                 {
-                    restartGame(game);
+                    game.audio.toggleMute();
+                }
+                else if (key->code == sf::Keyboard::Key::M)
+                {
+                    returnToMenu(game);
+                    resetTiming = true;
+                }
+                else if (key->code == sf::Keyboard::Key::Enter
+                    && (game.state == State::Menu
+                        || game.state == State::Won
+                        || game.state == State::GameOver))
+                {
+                    startGame(game);
+                    resetTiming = true;
+                }
+                else if (key->code == sf::Keyboard::Key::R
+                    && game.state != State::Menu)
+                {
+                    startGame(game);
                     resetTiming = true;
                 }
                 else if (key->code == sf::Keyboard::Key::P)
@@ -888,24 +1298,26 @@ int main()
                         game.state = State::Paused;
                         resetTiming = true;
                     }
-                    else if (game.state == State::Paused
-                        && window.hasFocus())
+                    else if (game.state == State::Paused && window.hasFocus())
                     {
                         game.state = State::Playing;
                         resetTiming = true;
                     }
 
-                    game.jumpRequested = false;
+                    game.jumpBuffer = 0.f;
                 }
                 else if (key->code == sf::Keyboard::Key::Space
                     && game.state == State::Playing)
                 {
-                    game.jumpRequested = true;
+                    game.jumpBuffer = 0.12f;
                 }
             }
 
             if (!window.isOpen())
                 break;
+
+            game.audio.setPaused(game.state == State::Paused);
+            game.audio.cleanup();
 
             float elapsed =
                 std::min(clock.restart().asSeconds(), 0.1f);
@@ -935,8 +1347,7 @@ int main()
                     accumulator = 0.f;
             }
 
-            updateTitle(window, game);
-            drawGame(window, game);
+            drawGame(window, font, game);
         }
     }
     catch (const std::exception& error)
